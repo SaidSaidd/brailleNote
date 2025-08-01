@@ -1,8 +1,6 @@
-from dotenv import load_dotenv
 import os
 
-load_dotenv()
-API_KEY = os.getenv("API_KEY")
+API_KEY = "API-KEY"
 
 import assemblyai as aai
 aai.settings.api_key = API_KEY
@@ -130,7 +128,7 @@ def main():
         wav_filename = f"session{idx}.wav"
         txt_filename = f"transcript{idx}.txt"
 
-        # write out the raw audio
+        # 1) write out the raw audio
         mic.close()
         with wave.open(wav_filename, "wb") as wf:
             wf.setnchannels(1)
@@ -138,12 +136,40 @@ def main():
             wf.setframerate(mic.rate)
             wf.writeframes(b"".join(mic.frames))
 
-        # write out the deduplicated transcript
+        # 2) write out the transcript
         with open(txt_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
 
+        # --- 3) now that session{idx}.wav exists, generate AI summary ---
+        from assemblyai import Transcriber, TranscriptionConfig, SummarizationModel, SummarizationType
+
+        summary_filename = f"summary{idx}.txt"
+        config = TranscriptionConfig(
+            summarization=True,
+            summary_model=SummarizationModel.informative,
+            summary_type=SummarizationType.bullets,
+        )
+
+        print("Generating AI summary… press Ctrl+C to cancel if it hangs.")
+        try:
+            summary_job = Transcriber().transcribe(wav_filename, config)
+            summary = summary_job.summary or ""
+            with open(summary_filename, "w", encoding="utf-8") as f:
+                f.write(summary)
+            print(f"Saved summary to {summary_filename}")
+        except KeyboardInterrupt:
+            print("Summary generation interrupted by user.")
+        except Exception as e:
+            print(f"Summary generation failed: {e}")
+
+        # 4) finally disconnect
         client.disconnect(terminate=True)
-        print(f"Done — saved {wav_filename} & {txt_filename}")
+        print(f"Done — saved {wav_filename}, {txt_filename}", end="")
+        if os.path.exists(summary_filename):
+            print(f", and {summary_filename}")
+        else:
+            print("")
+
 
 if __name__ == "__main__":
     main()

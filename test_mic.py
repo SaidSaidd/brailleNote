@@ -1,14 +1,17 @@
 import os
 
-API_KEY = "API-KEY"
+API_KEY = "24dbb8cb45604865b1ed162a9e5c382a"
 
 import assemblyai as aai
 aai.settings.api_key = API_KEY
-
+import gzip
 import glob
 import re              # for normalization
 import wave
 import logging
+import cv2
+import threading
+import time
 from typing import Type
 
 from assemblyai.streaming.v3 import (
@@ -26,6 +29,45 @@ import pyaudio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+VISUAL_TRIGGERS = [
+    "as you can see",
+    "diagram",
+    "on the board",
+    "slide",
+    "illustration",
+    "look at this",
+]
+# a thread-safe flag so we don’t fire twice in quick succession
+capturing = threading.Event()
+
+def capture_video(idx: int, duration: float = 3.0, fps: int = 20):
+    """
+    Record `duration` seconds of video from camera 0 and save as session{idx}.avi
+    """
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("⚠️  Camera not available.")
+        return
+
+    # frame size from camera
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out    = cv2.VideoWriter(f"session{idx}_video.avi", fourcc, fps, (width, height))
+
+    start = time.time()
+    while time.time() - start < duration:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out.write(frame)
+    out.release()
+    cap.release()
+    print(f"📷 Saved visual clip → session{idx}_video.avi")
+    # reset flag so next trigger can fire later
+    capturing.clear()
+
 
 # -----------------------------------------------------------------------------
 # 1) PyAudio generator to capture raw audio chunks
@@ -69,9 +111,20 @@ def on_begin(self: Type[StreamingClient], event: BeginEvent):
     print(f"Session started: {event.id}")
 
 def on_turn(self: Type[StreamingClient], event: TurnEvent):
-    # capture *only* the formatted, finalized turn
+    global capturing
+
     if event.end_of_turn and event.turn_is_formatted:
-        transcript_lines.append(event.transcript.strip())
+        text = event.transcript.strip()
+        transcript_lines.append(text)
+
+        lower = text.lower()
+        # check for any of our visual cue phrases
+        if any(kw in lower for kw in VISUAL_TRIGGERS) and not capturing.is_set():
+            capturing.set()
+            # determine the upcoming index for naming consistency
+            idx = get_next_index()  
+            # spawn camera capture in background
+            threading.Thread(target=capture_video, args=(idx,), daemon=True).start()
 
     # still print everything for debug
     conf = getattr(event, "end_of_turn_confidence", None)
@@ -102,6 +155,7 @@ def get_next_index():
         if m:
             nums.append(int(m.group(1)))
     return max(nums) + 1 if nums else 1
+
 
 def main():
     client = StreamingClient(

@@ -1,18 +1,18 @@
 import os
-
-API_KEY = "24dbb8cb45604865b1ed162a9e5c382a"
-
-import assemblyai as aai
-aai.settings.api_key = API_KEY
-import gzip
-import glob
-import re              # for normalization
 import wave
-import logging
-import cv2
-import threading
+import glob
+import re
 import time
+import cv2
+import openai
+import logging
+import threading
 from typing import Type
+from PIL import Image
+from dotenv import load_dotenv
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import assemblyai as aai
+import pyaudio
 
 from assemblyai.streaming.v3 import (
     StreamingClient,
@@ -25,53 +25,107 @@ from assemblyai.streaming.v3 import (
     TerminationEvent,
     StreamingError,
 )
-import pyaudio
+
+# Load environment variables
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
+openai.api_key = os.getenv("OPENAI_API_KEY")
+aai.settings.api_key = API_KEY
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VISUAL_TRIGGERS = [
-    "as you can see",
-    "diagram",
-    "on the board",
-    "slide",
-    "illustration",
-    "look at this",
-]
-# a thread-safe flag so we don’t fire twice in quick succession
-capturing = threading.Event()
+# Load BLIP model
+try:
+    processor = BlipProcessor.from_pretrained(
+        "Salesforce/blip-image-captioning-large",
+        local_files_only=True
+    )
+    model = BlipForConditionalGeneration.from_pretrained(
+        "Salesforce/blip-image-captioning-large",
+        local_files_only=True
+    )
+    print("✅ Loaded BLIP model from cache.")
+except Exception:
+    processor = None
+    model = None
+    print("⚠️  BLIP model not found locally. Visual descriptions will be skipped.")
 
-def capture_video(idx: int, duration: float = 3.0, fps: int = 20):
-    """
-    Record `duration` seconds of video from camera 0 and save as session{idx}.avi
-    """
+# Comprehensive list of visual triggers
+VISUAL_TRIGGERS = [
+    "as you can see", "as we can see", "look at this", "if you look here", "shown here", "depicted here",
+    "on the board", "on this board", "on the screen", "on this screen", "on the slide", "on this slide",
+    "on the whiteboard", "on this chart", "up on the board", "what's shown here",
+    "this figure shows", "this diagram", "this image shows", "pictured here", "take a look at",
+    "check this out", "observe this", "illustrated here", "refer to this image",
+    "notice how", "you'll notice", "focus on this", "here's a diagram", "this chart demonstrates",
+    "this example shows", "i'm holding up a", "visualize this", "you can see the"
+]
+
+capturing = threading.Event()
+transcript_lines = []
+
+# OpenAI wrapper updated for openai>=1.0.0
+def ask_openai(prompt: str, model_name="gpt-4") -> str:
+    try:
+        response = openai.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You describe images for visually impaired users."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=300,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(OpenAI error: {e})"
+
+def capture_and_describe(idx: int):
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("⚠️  Camera not available.")
+    # optionally force a smaller frame for faster read
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    if not processor or not model:
+        transcript_lines.append("[Visual Description: ⧗ model unavailable]")
+        capturing.clear()
         return
 
-    # frame size from camera
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out    = cv2.VideoWriter(f"session{idx}_video.avi", fourcc, fps, (width, height))
+    if not cap.isOpened():
+        transcript_lines.append("[Visual Description: camera unavailable]")
+        capturing.clear()
+        return
 
-    start = time.time()
-    while time.time() - start < duration:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        out.write(frame)
-    out.release()
+    ret, frame = cap.read()
     cap.release()
-    print(f"📷 Saved visual clip → session{idx}_video.avi")
-    # reset flag so next trigger can fire later
+    if not ret:
+        transcript_lines.append("[Visual Description: frame capture failed]")
+        capturing.clear()
+        return
+
+    img_filename = f"session{idx}_image.jpg"
+    cv2.imwrite(img_filename, frame)
+    print(f"📷 Captured image → {img_filename}")
+
+    raw = Image.open(img_filename).convert("RGB")
+    inputs = processor(raw, return_tensors="pt")
+    out = model.generate(**inputs)
+    caption = processor.decode(out[0], skip_special_tokens=True)
+
+    prompt = (
+        "You are an assistant that describes classroom visuals for a visually impaired student. "
+        "Focus only on the educational content displayed—such as bullet points, graphs, diagrams, or text on the board or slide. "
+        f"Ignore any details about the person holding the material or the surrounding environment. "
+        f"Here is a short caption: “{caption}”. Expand it into a detailed, objective description of the visual content that the student needs to understand."
+    )
+    detail = ask_openai(prompt)
+    line = f"[Visual Description: {detail}]"
+    transcript_lines.append(line)
+    print("🔊", line)
     capturing.clear()
 
-
-# -----------------------------------------------------------------------------
-# 1) PyAudio generator to capture raw audio chunks
-# -----------------------------------------------------------------------------
 class AudioGenerator:
     def __init__(self, rate=16000, chunk_size=1024):
         self.rate = rate
@@ -99,14 +153,6 @@ class AudioGenerator:
         self.stream.close()
         self.p.terminate()
 
-# -----------------------------------------------------------------------------
-# 2) Globals to collect transcript and dedupe repeated lines
-# -----------------------------------------------------------------------------
-transcript_lines = []
-
-# -----------------------------------------------------------------------------
-# 3) Event handlers
-# -----------------------------------------------------------------------------
 def on_begin(self: Type[StreamingClient], event: BeginEvent):
     print(f"Session started: {event.id}")
 
@@ -118,22 +164,16 @@ def on_turn(self: Type[StreamingClient], event: TurnEvent):
         transcript_lines.append(text)
 
         lower = text.lower()
-        # check for any of our visual cue phrases
-        if any(kw in lower for kw in VISUAL_TRIGGERS) and not capturing.is_set():
+        # fuzzy trigger matching with word boundaries
+        if any(re.search(rf"\b{re.escape(kw)}\b", lower) for kw in VISUAL_TRIGGERS) and not capturing.is_set():
+            print(f"📌 Visual trigger detected: '{text}'")
             capturing.set()
-            # determine the upcoming index for naming consistency
-            idx = get_next_index()  
-            # spawn camera capture in background
-            threading.Thread(target=capture_video, args=(idx,), daemon=True).start()
+            idx = get_next_index()
+            threading.Thread(target=capture_and_describe, args=(idx,), daemon=True).start()
 
-    # still print everything for debug
     conf = getattr(event, "end_of_turn_confidence", None)
-    print(
-        f"Turn: '{event.transcript}'"
-        + (f" (Confidence: {conf:.2f})" if conf is not None else "")
-    )
+    print(f"Turn: '{event.transcript}'" + (f" (Confidence: {conf:.2f})" if conf is not None else ""))
 
-    # tell the service to format future turns
     if event.end_of_turn and not event.turn_is_formatted:
         self.set_params(StreamingSessionParameters(format_turns=True))
 
@@ -143,9 +183,6 @@ def on_terminated(self: Type[StreamingClient], event: TerminationEvent):
 def on_error(self: Type[StreamingClient], error: StreamingError):
     print(f"Error: {error}")
 
-# -----------------------------------------------------------------------------
-# 4) Helpers & main loop
-# -----------------------------------------------------------------------------
 def get_next_index():
     files = glob.glob("session*.wav")
     nums = []
@@ -155,7 +192,6 @@ def get_next_index():
         if m:
             nums.append(int(m.group(1)))
     return max(nums) + 1 if nums else 1
-
 
 def main():
     client = StreamingClient(
@@ -178,11 +214,15 @@ def main():
     except Exception as e:
         print(f"Streaming error: {e}")
     finally:
+        # Wait up to 5 seconds for any visual capture to finish
+        wait_deadline = time.time() + 5
+        while capturing.is_set() and time.time() < wait_deadline:
+            time.sleep(0.1)
+
         idx = get_next_index()
         wav_filename = f"session{idx}.wav"
         txt_filename = f"transcript{idx}.txt"
 
-        # 1) write out the raw audio
         mic.close()
         with wave.open(wav_filename, "wb") as wf:
             wf.setnchannels(1)
@@ -190,13 +230,10 @@ def main():
             wf.setframerate(mic.rate)
             wf.writeframes(b"".join(mic.frames))
 
-        # 2) write out the transcript
         with open(txt_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
 
-        # --- 3) now that session{idx}.wav exists, generate AI summary ---
         from assemblyai import Transcriber, TranscriptionConfig, SummarizationModel, SummarizationType
-
         summary_filename = f"summary{idx}.txt"
         config = TranscriptionConfig(
             summarization=True,
@@ -216,14 +253,12 @@ def main():
         except Exception as e:
             print(f"Summary generation failed: {e}")
 
-        # 4) finally disconnect
         client.disconnect(terminate=True)
         print(f"Done — saved {wav_filename}, {txt_filename}", end="")
         if os.path.exists(summary_filename):
             print(f", and {summary_filename}")
         else:
             print("")
-
 
 if __name__ == "__main__":
     main()

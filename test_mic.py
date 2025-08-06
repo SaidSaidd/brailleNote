@@ -25,6 +25,20 @@ from assemblyai.streaming.v3 import (
     TerminationEvent,
     StreamingError,
 )
+latest_frame = None
+_frame_grabber_stop = False
+def frame_grabber():
+    global latest_frame, _frame_grabber_stop
+    cap = cv2.VideoCapture(0)
+    # optionally set a lower resolution for speed
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    while not _frame_grabber_stop:
+        ret, frame = cap.read()
+        if ret:
+            latest_frame = frame
+    cap.release()
 
 # Load environment variables
 load_dotenv()
@@ -83,25 +97,14 @@ def ask_openai(prompt: str, model_name="gpt-4") -> str:
         return f"(OpenAI error: {e})"
 
 def capture_and_describe(idx: int):
-    cap = cv2.VideoCapture(0)
-    # optionally force a smaller frame for faster read
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # wait up to 1 s for a frame to appear
+    deadline = time.time() + 1
+    frame = None
+    while frame is None and time.time() < deadline:
+        frame = latest_frame
 
-    if not processor or not model:
-        transcript_lines.append("[Visual Description: ⧗ model unavailable]")
-        capturing.clear()
-        return
-
-    if not cap.isOpened():
-        transcript_lines.append("[Visual Description: camera unavailable]")
-        capturing.clear()
-        return
-
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        transcript_lines.append("[Visual Description: frame capture failed]")
+    if frame is None:
+        transcript_lines.append("[Visual Description: no frame available]")
         capturing.clear()
         return
 
@@ -109,17 +112,23 @@ def capture_and_describe(idx: int):
     cv2.imwrite(img_filename, frame)
     print(f"📷 Captured image → {img_filename}")
 
-    raw = Image.open(img_filename).convert("RGB")
+    # then continue with your existing image-to-text logic (BLIP + GPT)…
+
+
+    # BLIP caption
+    raw = Image.fromarray(frame[..., ::-1]).convert("RGB")
     inputs = processor(raw, return_tensors="pt")
     out = model.generate(**inputs)
     caption = processor.decode(out[0], skip_special_tokens=True)
 
+    # GPT elaboration
     prompt = (
-        "You are an assistant that describes classroom visuals for a visually impaired student. "
-        "Focus only on the educational content displayed—such as bullet points, graphs, diagrams, or text on the board or slide. "
-        f"Ignore any details about the person holding the material or the surrounding environment. "
-        f"Here is a short caption: “{caption}”. Expand it into a detailed, objective description of the visual content that the student needs to understand."
-    )
+    "You are an assistant describing classroom visuals for a visually impaired student. "
+    f"The student cannot see the board or screen, so your job is to clearly describe only the key visual content that is relevant to the lecture. "
+    "Ignore the teacher’s appearance or classroom environment. Focus entirely on what's being displayed or held up, such as images, graphs, text, or diagrams. "
+    f"Here is a short caption from the image: “{caption}”. Expand it into a clear and concise educational description the student can recall later."
+)
+
     detail = ask_openai(prompt)
     line = f"[Visual Description: {detail}]"
     transcript_lines.append(line)
@@ -194,6 +203,8 @@ def get_next_index():
     return max(nums) + 1 if nums else 1
 
 def main():
+    threading.Thread(target=frame_grabber, daemon=True).start()
+
     client = StreamingClient(
         StreamingClientOptions(api_key=API_KEY, api_host="streaming.assemblyai.com")
     )
@@ -214,6 +225,8 @@ def main():
     except Exception as e:
         print(f"Streaming error: {e}")
     finally:
+        _frame_grabber_stop = True
+
         # Wait up to 5 seconds for any visual capture to finish
         wait_deadline = time.time() + 5
         while capturing.is_set() and time.time() < wait_deadline:

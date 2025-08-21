@@ -1,29 +1,12 @@
 # podcast_mode_router.py
 """
-Route-by-voice (or text) to the right transcript, then start a 'podcast' coaching session.
-- Software-only. No GPIO/Arduino/Raspberry Pi required.
-- Works with typed commands OR your own STT function (plug-in).
-- Scans a project folder for transcripts like transcript14.txt, lecture27.txt, notes03.txt, etc.
-
-CLI examples
-------------
-$ python podcast_mode_router.py --root . --say "help me understand lecture27" --tts off
-$ python podcast_mode_router.py --root . --interactive --tts on
-$ python podcast_mode_router.py --root /path/to/project --turns 4
-
-Integrating with your app
--------------------------
-from podcast_mode_router import PodcastRouter
-
-router = PodcastRouter(root=".", model="gpt-4", tts=False)
-router.route_and_start_by_text("can you help me understand lecture27?")
-
-# If you already have STT:
-def my_transcribe_once() -> str:
-    # return the latest ASR text from your pipeline
-    ...
-
-router.route_and_start_by_audio(my_transcribe_once)
+Route-by-command to the right transcript, then (optionally) start a podcast-style session.
+- Software-only (no GPIO).
+- Auto-loads .env (OPENAI_API_KEY).
+- Resolves: exact filename (e.g., transcript29.txt), "lecture 29", "transcript 29",
+  a bare number "29", or "latest"/"most recent".
+- Includes a text/TTY coach for keyboard interaction (kept for convenience).
+- Exported helper: resolve_only(command_text) returns a path without launching a session.
 """
 
 import os
@@ -32,11 +15,13 @@ import json
 import argparse
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
+
 from dotenv import load_dotenv
 load_dotenv()
-# Soft deps
+
+# --- Soft deps ---
 try:
-    import openai
+    import openai  # works with openai.chat.completions.create
 except Exception:
     openai = None
 
@@ -47,7 +32,7 @@ except Exception:
 
 
 # -----------------------------
-# Common utils
+# Utilities
 # -----------------------------
 
 def _safe_openai():
@@ -64,7 +49,7 @@ def _truncate(s: str, limit: int = 12000) -> str:
 
 
 # -----------------------------
-# Speakers
+# Coach (text I/O; optional)
 # -----------------------------
 
 class BaseSpeaker:
@@ -90,10 +75,6 @@ class TTSSpeaker(Basepeaker := BaseSpeaker):
         self.eng.runAndWait()
 
 
-# -----------------------------
-# Brain
-# -----------------------------
-
 @dataclass
 class NoteCoachBrain:
     model: str = "gpt-4"
@@ -109,7 +90,6 @@ class NoteCoachBrain:
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=30
         )
         return resp.choices[0].message.content.strip()
 
@@ -153,10 +133,6 @@ class NoteCoachBrain:
             return "What should we tackle next?", out
 
 
-# -----------------------------
-# Coach (interaction)
-# -----------------------------
-
 @dataclass
 class PodcastCoach:
     model: str = "gpt-4"
@@ -175,7 +151,10 @@ class PodcastCoach:
         self.history.append({"role": "host", "text": host_q})
 
         for _ in range(max_turns):
-            student = input("\n👤 You: ").strip()
+            try:
+                student = input("\n👤 You: ").strip()
+            except EOFError:
+                break
             if not student:
                 break
             self.history.append({"role": "student", "text": student})
@@ -187,19 +166,6 @@ class PodcastCoach:
 
         self.speaker.say("That's a wrap. Want to continue later, just run this again.")
 
-    def next_turn(self, transcript_text: str, student_reply: str) -> Tuple[str, str]:
-        if not self.history:
-            primer, host_q = self.brain.kickoff(transcript_text)
-            if primer:
-                self.history.append({"role": "primer", "text": primer})
-            self.history.append({"role": "host", "text": host_q})
-
-        self.history.append({"role": "student", "text": student_reply})
-        host, mentor = self.brain.respond(transcript_text, self.history, student_reply)
-        self.history.append({"role": "host", "text": host})
-        self.history.append({"role": "mentor", "text": mentor})
-        return host, mentor
-
 
 # -----------------------------
 # File catalog + routing
@@ -208,63 +174,110 @@ class PodcastCoach:
 @dataclass
 class FileCatalog:
     root: str = "."
-    index: Dict[str, str] = field(default_factory=dict)
+    by_filename: Dict[str, str] = field(default_factory=dict)
+    by_number: Dict[int, List[Tuple[int, str, str]]] = field(default_factory=dict)  # n -> list of (priority, path, label)
 
     def scan(self) -> None:
-        self.index.clear()
-        for fname in os.listdir(self.root):
+        self.by_filename.clear()
+        self.by_number.clear()
+
+        try:
+            entries = os.listdir(self.root)
+        except FileNotFoundError:
+            entries = []
+
+        for fname in entries:
             if not fname.lower().endswith(".txt"):
                 continue
             path = os.path.join(self.root, fname)
             base = os.path.splitext(fname)[0].lower()
+            self.by_filename[fname.lower()] = path
+            self.by_filename[base + ".txt"] = path  # normalized
 
-            # Create aliases
-            aliases = set()
-            aliases.add(fname.lower())
-            aliases.add(base)
-            m = re.search(r"(lecture|transcript|notes?)[-_ ]?(\d+)", base)
-            if m:
-                n = m.group(2).lstrip("0") or "0"
-                aliases.add(f"{m.group(1)}{n}")
-                aliases.add(f"lecture{n}")
-                aliases.add(f"transcript{n}")
-                aliases.add(f"notes{n}")
+            label, n = self._extract_label_and_number(base)
+            if n is not None:
+                prio = {"transcript": 0, "lecture": 1, "notes": 2, "generic": 3}.get(label, 3)
+                self.by_number.setdefault(n, []).append((prio, path, label))
 
-            # Register
-            for a in aliases:
-                self.index[a] = path
-
-    def resolve(self, utterance: str) -> Optional[str]:
-        """Map a free-form utterance to a transcript path."""
-        u = utterance.lower()
-
-        # 1) lecture / transcript / notes + number
-        m = re.search(r"(lecture|transcript|notes?)[-_ ]?(\d+)", u)
+    @staticmethod
+    def _extract_label_and_number(base: str) -> Tuple[str, Optional[int]]:
+        # Strong pattern: lecture/transcript/notes + number
+        m = re.search(r"\b(lecture|transcript|notes?)\s*[-_ ]?\s*(\d+)\b", base)
         if m:
-            key = f"{m.group(1)}{int(m.group(2))}"
-            if key in self.index:
-                return self.index[key]
+            return (m.group(1).rstrip('s'), int(m.group(2)))
+        # Fallback: any trailing number token
+        m2 = re.search(r"(\d+)\b", base)
+        if m2:
+            return ("generic", int(m2.group(1)))
+        return ("generic", None)
 
-        # 2) explicit filename present
-        m = re.search(r"([a-z0-9_\-]+\.txt)", u)
-        if m:
-            key = m.group(1).lower()
-            if key in self.index:
-                return self.index[key]
-
-        # 3) substring fuzzy (very light)
-        for k in sorted(self.index.keys(), key=len, reverse=True):
-            if k in u:
-                return self.index[k]
-
-        return None
+    def latest_path(self) -> Optional[str]:
+        candidates = [os.path.join(self.root, f) for f in os.listdir(self.root) if f.lower().endswith(".txt")]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
 
     def list_human(self) -> str:
-        items = sorted(set(self.index.values()))
+        try:
+            items = [f for f in os.listdir(self.root) if f.lower().endswith(".txt")]
+        except FileNotFoundError:
+            items = []
+        items.sort()
         lines = ["Found transcripts:"]
         for p in items:
-            lines.append(f" - {os.path.basename(p)}")
+            lines.append(f" - {p}")
         return "\n".join(lines)
+
+    def resolve(self, utterance: str) -> Optional[str]:
+        """
+        Map a free-form utterance to a transcript file path, with strict rules:
+          1) 'latest'/'most recent' -> newest by mtime
+          2) explicit filename *.txt -> exact match
+          3) '(lecture|transcript|notes) N' -> number match with label preference
+          4) bare number 'N' -> number match (prioritize transcript, then lecture, then notes, then generic)
+          otherwise: None
+        """
+        if not utterance:
+            return None
+        u = utterance.lower().strip()
+
+        # 1) latest
+        if re.search(r"\b(latest|most\s+recent)\b", u):
+            return self.latest_path()
+
+        # 2) explicit filename
+        m = re.search(r"([a-z0-9_\-]+\.txt)\b", u)
+        if m:
+            key = m.group(1).lower()
+            if key in self.by_filename:
+                return self.by_filename[key]
+
+        # 3) label + number
+        m = re.search(r"\b(lecture|transcript|notes?)\s*[-_ ]?\s*(\d+)\b", u)
+        if m:
+            label = m.group(1).rstrip('s')
+            n = int(m.group(2))
+            candidates = self.by_number.get(n, [])
+            if not candidates:
+                return None
+            # Prefer same label; else priority order
+            same_label = [p for pr, p, lbl in candidates if lbl == label]
+            if same_label:
+                return same_label[0]
+            best = sorted(candidates, key=lambda t: t[0])[0]
+            return best[1]
+
+        # 4) bare number
+        m = re.search(r"\b(\d{1,5})\b", u)
+        if m:
+            n = int(m.group(1))
+            candidates = self.by_number.get(n, [])
+            if candidates:
+                best = sorted(candidates, key=lambda t: t[0])[0]
+                return best[1]
+
+        return None
 
 
 # -----------------------------
@@ -285,31 +298,23 @@ class PodcastRouter:
         self.catalog.scan()
         self.coach = PodcastCoach(model=self.model, tts=self.tts)
 
+    # NEW: just resolve, don't start a session
+    def resolve_only(self, command_text: str) -> Optional[str]:
+        self.catalog.scan()
+        return self.catalog.resolve(command_text)
+
     def route_and_start_by_text(self, command_text: str) -> Optional[str]:
+        self.catalog.scan()
         path = self.catalog.resolve(command_text)
         if not path:
             print(self.catalog.list_human())
-            print("Couldn't resolve that request. Try 'lecture14' or 'transcript27.txt'.")
+            print("Couldn't resolve that request. Try 'lecture 29', 'transcript29.txt', or 'latest'.")
             return None
         with open(path, "r", encoding="utf-8") as f:
             transcript = f.read()
         print(f"\n📄 Using transcript: {os.path.basename(path)}\n")
         self.coach.start_session(transcript, max_turns=self.turns)
         return path
-
-    def route_and_start_by_audio(self, transcribe_once_callable) -> Optional[str]:
-        """
-        Plug in your own STT function that returns one utterance of text.
-        Example:
-            def my_stt():
-                # block until you have one utterance
-                return asr_text
-            router.route_and_start_by_audio(my_stt)
-        """
-        if not callable(transcribe_once_callable):
-            raise ValueError("transcribe_once_callable must be a callable returning a string utterance.")
-        utterance = transcribe_once_callable()
-        return self.route_and_start_by_text(utterance)
 
 
 # -----------------------------
@@ -319,7 +324,7 @@ class PodcastRouter:
 def _cli():
     ap = argparse.ArgumentParser(description="Podcast Router (software-only)")
     ap.add_argument("--root", type=str, default=".", help="project folder with transcript files (txt)")
-    ap.add_argument("--say", type=str, default=None, help="free-form command like 'help me understand lecture27'")
+    ap.add_argument("--say", type=str, default=None, help="free-form command like 'help me understand lecture 29'")
     ap.add_argument("--interactive", action="store_true", help="prompt to type your command")
     ap.add_argument("--tts", choices=["on", "off"], default="off", help="text-to-speech via pyttsx3")
     ap.add_argument("--model", type=str, default="gpt-4", help="OpenAI model name")
@@ -335,7 +340,7 @@ def _cli():
         cmd = input("\nWhat do you want to study? ")
         router.route_and_start_by_text(cmd)
     else:
-        print("Nothing to do. Pass --say 'help me understand lecture27' or --interactive.")
+        print("Nothing to do. Pass --say 'help me understand lecture 29' or --interactive.")
 
 if __name__ == "__main__":
     _cli()

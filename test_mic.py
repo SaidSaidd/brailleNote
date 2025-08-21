@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import assemblyai as aai
 import pyaudio
-from podcast_mode_router import PodcastRouter
 
 
 from assemblyai.streaming.v3 import (
@@ -67,13 +66,6 @@ except Exception:
     model = None
     print("⚠️  BLIP model not found locally. Visual descriptions will be skipped.")
 
-router = PodcastRouter(root=".", model="gpt-4", tts=False, turns=4)
-
-def my_transcribe_once():
-    # Return ONE line from your STT pipeline, e.g. latest user command
-    return "can you help me understand lecture14"
-
-router.route_and_start_by_audio(my_transcribe_once)
 # Comprehensive list of visual triggers
 VISUAL_TRIGGERS = [
     "as you can see", "as we can see", "look at this", "if you look here", "shown here", "depicted here",

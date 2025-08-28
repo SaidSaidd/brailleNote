@@ -1,35 +1,43 @@
 # podcast_voice_session.py
 """
 Voice-first flow to study past lectures:
- 1) Listen for a VOICE COMMAND like “help me understand lecture 30” (AssemblyAI).
- 2) Resolve that to a transcript file using PodcastRouter.resolve_only().
- 3) Run a VOICE podcast:
-    - Primer + host question are SPOKEN (and printed)
-    - Student replies by voice (AssemblyAI)
-    - Mentor answers are SPOKEN (and printed); loop for N turns
+ 1) VOICE COMMAND picks transcript (AssemblyAI): e.g., “lecture 30”, “open transcript 30”, or “latest”.
+ 2) Single-voice COACH runs a podcast-like chat:
+    - Coach gives brief context AND asks one good question each turn.
+    - Student replies by voice; system transcribes and continues.
+    - Fully voiced AND printed for testing.
+    - Say a STOP phrase to end (e.g., "stop", "quit", "that's all", "end session").
 
 Improvements:
- - No leftover WAVs in your project (temporary files auto-removed).
- - Better pacing: clause-level speaking + configurable pauses +
-   optional wait for ~3s of room silence before “Your turn.”
- - More realistic voice option: set VOICE_PROVIDER=openai for OpenAI TTS.
+ - One COACH voice (merged Host + Mentor).
+ - Faster pacing (set in .env): TTS_RATE_FACTOR, CLAUSE_PAUSE, HOST_SILENCE_SECS.
+ - Robust OpenAI TTS (WAV/MP3) with fallback to pyttsx3.
+ - No leftover WAVs in your project (temp files auto-removed).
 
 Requirements (once in your venv):
-  pip install openai python-dotenv assemblyai pyttsx3 pyaudio numpy requests
+  pip install openai python-dotenv assemblyai pyttsx3 pyaudio numpy requests playsound==1.2.2
 
 .env:
   OPENAI_API_KEY=sk-...
   API_KEY=<your AssemblyAI key>
-  # Optional (for better TTS):
-  VOICE_PROVIDER=openai         # or omit/pyttsx3
+
+  # Optional, for more natural TTS (OpenAI)
+  VOICE_PROVIDER=openai          # or omit/pyttsx3
   OPENAI_TTS_MODEL=gpt-4o-mini-tts
-  OPENAI_TTS_VOICE=alloy        # alloy | verse | aria | etc.
-  HOST_SILENCE_SECS=3.0         # seconds of room silence to wait after host speaks
+  OPENAI_TTS_VOICE=alloy         # try aria, verse, etc.
+
+  # Pacing
+  TTS_RATE_FACTOR=1.25           # ~25% faster
+  CLAUSE_PAUSE=0.20              # seconds between clauses
+  HOST_SILENCE_SECS=2.0          # wait for this much room quiet after Coach speaks
+
+  # Optional stop words customization (comma-separated)
+  STOP_WORDS=stop,quit,exit,cancel,that's all,thats all,that is all,end session,goodbye,bye,finish,done
 """
 
 import os
-import io
 import re
+import io
 import time
 import json
 import wave
@@ -43,7 +51,7 @@ import pyttsx3
 import requests
 from dotenv import load_dotenv
 
-from podcast_mode_router import PodcastRouter  # only used to RESOLVE the transcript path
+from podcast_mode_router import PodcastRouter  # used for resolving the transcript path
 
 import assemblyai as aai
 import openai
@@ -65,10 +73,25 @@ if not AIA_KEY:
 openai.api_key = OPENAI_API_KEY
 aai.settings.api_key = AIA_KEY
 
-VOICE_PROVIDER = os.getenv("VOICE_PROVIDER", "pyttsx3").lower()  # "pyttsx3" or "openai"
-OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy")
-HOST_SILENCE_SECS = float(os.getenv("HOST_SILENCE_SECS", "3.0"))
+VOICE_PROVIDER     = os.getenv("VOICE_PROVIDER", "pyttsx3").lower()  # "pyttsx3" or "openai"
+OPENAI_TTS_MODEL   = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+OPENAI_TTS_VOICE   = os.getenv("OPENAI_TTS_VOICE", "alloy")
+
+# pacing knobs
+TTS_RATE_FACTOR    = float(os.getenv("TTS_RATE_FACTOR", "1.25"))   # ~25% faster
+CLAUSE_PAUSE       = float(os.getenv("CLAUSE_PAUSE", "0.20"))      # seconds between clauses
+HOST_SILENCE_SECS  = float(os.getenv("HOST_SILENCE_SECS", "2.0"))  # post-coach quiet wait
+
+STOP_WORDS = [w.strip().lower() for w in os.getenv(
+    "STOP_WORDS",
+    "stop,quit,exit,cancel,that's all,thats all,that is all,end session,goodbye,bye,finish,done"
+).split(",") if w.strip()]
+
+def is_stop_phrase(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    return any(w in t for w in STOP_WORDS)
 
 # ---------------------------
 # Audio I/O helpers
@@ -91,7 +114,7 @@ class MicRecorder:
 
     def record_until_silence(
         self,
-        min_talk_seconds: float = 0.6,
+        min_talk_seconds: float = 0.3,
         trailing_silence: float = 0.8,
         overall_timeout: float = 12.0,
         start_threshold: int = 800,
@@ -142,7 +165,6 @@ def transcribe_one_utterance_bytes(pcm_bytes: bytes, rate: int = 16000) -> str:
     with tempfile.NamedTemporaryFile(prefix="voice_", suffix=".wav", delete=False) as tf:
         temp_wav = tf.name
     try:
-        # write wave header + frames
         p = pyaudio.PyAudio()
         sampwidth = p.get_sample_size(pyaudio.paInt16)
         with wave.open(temp_wav, "wb") as wf:
@@ -166,19 +188,17 @@ def transcribe_one_utterance_bytes(pcm_bytes: bytes, rate: int = 16000) -> str:
 
 
 # ---------------------------
-# TTS: pyttsx3 provider
+# TTS: pyttsx3 provider (offline)
 # ---------------------------
 
 class Pyttsx3TTS:
-    def __init__(self, voice_substr: Optional[str] = None, rate_factor: float = 0.9):
+    def __init__(self, voice_substr: Optional[str] = None, rate_factor: float = TTS_RATE_FACTOR):
         self.eng = pyttsx3.init()
-        # voice selection (best-effort)
         if voice_substr:
             for v in self.eng.getProperty("voices"):
                 if voice_substr.lower() in (v.name or "").lower():
                     self.eng.setProperty("voice", v.id)
                     break
-        # pacing
         rate = self.eng.getProperty("rate")
         self.eng.setProperty("rate", max(120, int(rate * rate_factor)))
 
@@ -188,7 +208,7 @@ class Pyttsx3TTS:
 
 
 # ---------------------------
-# TTS: OpenAI provider (more natural)
+# TTS: OpenAI provider (WAV/MP3 with fallback)
 # ---------------------------
 
 class OpenAITTS:
@@ -200,23 +220,36 @@ class OpenAITTS:
         self._headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
+            "Accept": "*/*",
         }
+        self._fallback = Pyttsx3TTS(voice_substr=os.getenv("PYTTSX3_VOICE", None))
 
     def speak(self, text: str):
         payload = {
             "model": self.model,
             "voice": self.voice,
             "input": text,
-            "format": "wav",
+            "format": "wav",  # server may still return mp3
         }
-        r = self._session.post(self._url, headers=self._headers, json=payload, timeout=120)
-        r.raise_for_status()
-        audio_bytes = r.content
-        self._play_wav_bytes(audio_bytes)
+        try:
+            r = self._session.post(self._url, headers=self._headers, json=payload, timeout=120)
+            r.raise_for_status()
+            audio_bytes = r.content
+            ctype = r.headers.get("Content-Type", "")
+            # WAV?
+            if "audio/wav" in ctype or (len(audio_bytes) >= 4 and audio_bytes[:4] == b"RIFF"):
+                return self._play_wav_bytes(audio_bytes)
+            # MP3?
+            if "audio/mpeg" in ctype or audio_bytes[:3] == b"\xFF\xFB" or audio_bytes[:2] == b"\xFF\xF3":
+                return self._play_mp3_bytes(audio_bytes)
+            print(f"[TTS] Unexpected content-type ({ctype}). Falling back to pyttsx3.")
+            self._fallback.speak(text)
+        except Exception as e:
+            print(f"[TTS] OpenAI TTS error: {e}. Falling back to pyttsx3.")
+            self._fallback.speak(text)
 
     @staticmethod
     def _play_wav_bytes(b: bytes):
-        import io
         with wave.open(io.BytesIO(b), "rb") as wf:
             p = pyaudio.PyAudio()
             stream = p.open(
@@ -233,103 +266,96 @@ class OpenAITTS:
             stream.close()
             p.terminate()
 
+    @staticmethod
+    def _play_mp3_bytes(b: bytes):
+        import tempfile
+        from playsound import playsound
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                tf.write(b)
+                path = tf.name
+            playsound(path)  # blocking playback
+        finally:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
 
 # ---------------------------
-# Speaker facade (clause pacing + silence wait)
+# Speaker: clause pacing + silence gate + Coach wrappers
 # ---------------------------
 
 def _split_into_clauses(text: str) -> List[str]:
-    # split on sentence-ish punctuation, keep simple
     parts = re.split(r'([.!?;:])', text)
-    chunks = []
-    buf = ""
+    chunks, buf = [], ""
     for part in parts:
         if part in ".!?;:":
             buf += part
-            chunks.append(buf.strip())
-            buf = ""
+            chunks.append(buf.strip()); buf = ""
         else:
             buf += part
     if buf.strip():
         chunks.append(buf.strip())
-    # further split long clauses for breath
     final = []
     for c in chunks:
         if len(c) > 160:
-            # split on commas if very long
             sub = re.split(r'(,)', c)
             agg = ""
             for s in sub:
                 agg += s
                 if len(agg) > 80:
-                    final.append(agg.strip())
-                    agg = ""
-            if agg.strip():
-                final.append(agg.strip())
+                    final.append(agg.strip()); agg = ""
+            if agg.strip(): final.append(agg.strip())
         else:
             final.append(c)
     return [c for c in final if c]
 
-
 class Speaker:
-    """Text + Voice with natural pauses and optional room-silence gating."""
+    """Text + Voice with natural pauses and room-silence gating."""
     def __init__(self, provider: str = VOICE_PROVIDER, silence_secs: float = HOST_SILENCE_SECS):
         self.silence_secs = silence_secs
         if provider == "openai":
             self.tts = OpenAITTS()
         else:
-            # Pick a Windows voice if you want (e.g., "Zira", "David", etc.)
             self.tts = Pyttsx3TTS(voice_substr=os.getenv("PYTTSX3_VOICE", None))
 
-    def say_block(self, text: str, between_clause_pause: float = 0.25):
+    def say_block(self, text: str, between_clause_pause: Optional[float] = None):
         print(text)
+        pause = CLAUSE_PAUSE if between_clause_pause is None else between_clause_pause
         for clause in _split_into_clauses(text):
             self.tts.speak(clause)
-            time.sleep(between_clause_pause)
+            time.sleep(pause)
 
-    def duet_host(self, host_line: str):
-        self.say_block(f"Host: {host_line}")
-        self.wait_for_room_silence(self.silence_secs, timeout=max(5.0, self.silence_secs + 2.0))
-
-    def duet_mentor(self, mentor_line: str):
-        self.say_block(f"Mentor: {mentor_line}")
-        # short breath after mentor
-        time.sleep(0.6)
+    def say_coach(self, line: str):
+        self.say_block(f"Host: {line}")
+        self.wait_for_room_silence(self.silence_secs, timeout=max(5.0, self.silence_secs))
 
     @staticmethod
     def wait_for_room_silence(required_secs: float, timeout: float, threshold: int = 450, chunk_ms: int = 100):
-        """
-        Wait until ambient mic input is 'quiet' (RMS below threshold) for required_secs.
-        Fallback stop at 'timeout' seconds so we never hang if the room is noisy.
-        """
-        if required_secs <= 0:
-            return
+        if required_secs <= 0: return
         p = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=int(16000 * chunk_ms / 1000))
-        quiet_ms = 0
-        waited = 0.0
+        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True,
+                        frames_per_buffer=int(16000 * chunk_ms / 1000))
+        quiet_ms = 0; waited = 0.0
         try:
             while waited < timeout and quiet_ms < required_secs * 1000:
                 data = stream.read(int(16000 * chunk_ms / 1000), exception_on_overflow=False)
                 samples = np.frombuffer(data, dtype=np.int16)
                 rms = int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-                if rms < threshold:
-                    quiet_ms += chunk_ms
-                else:
-                    quiet_ms = 0
-                time.sleep(chunk_ms / 1000.0)
-                waited += chunk_ms / 1000.0
+                quiet_ms = quiet_ms + chunk_ms if rms < threshold else 0
+                time.sleep(chunk_ms / 1000.0); waited += chunk_ms / 1000.0
         finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
+            stream.stop_stream(); stream.close(); p.terminate()
 
 
 # ---------------------------
-# LLM (host/mentor brains)
+# LLM: Single COACH (context + one question per turn)
 # ---------------------------
 
-class MentorLLM:
+class CoachLLM:
     def __init__(self, model: str = "gpt-4"):
         self.model = model
         openai.api_key = OPENAI_API_KEY
@@ -343,34 +369,37 @@ class MentorLLM:
         )
         return resp.choices[0].message.content.strip()
 
-    def kickoff(self, transcript: str, max_words: int = 110) -> Tuple[str, str]:
+    def kickoff(self, transcript: str, max_words: int = 90) -> str:
         sys = {
             "role": "system",
             "content": (
-                "You are a friendly, concise 'Note Coach' helping a student learn from a lecture transcript. "
-                "Podcast vibe—curious but focused. Keep language plain. No fluff. Keep each field <= 120 words."
+                "You are a single-voice 'Host' for a podcast-style study session. "
+                "Each turn, you:\n"
+                " - give a tiny bit of context (1–2 sentences), and\n"
+                " - ask ONE simple, engaging question to move the conversation.\n"
+                "Keep language plain, friendly, and <= 120 words total per turn."
             )
         }
         user = {
             "role": "user",
             "content": (
-                "Summarize the key idea in <= {} words, then craft ONE curious starter question to check understanding. "
-                "Return JSON with keys 'primer' and 'host_question'.\n\nTranscript:\n{}"
-            ).format(max_words, transcript[:12000])
+                "Using these notes (skim as needed), start the session with 1–2 sentences of context, "
+                "then ask ONE concise question that invites the student to pick a focus area. "
+                "Return ONLY the final line the Host should say.\n\nTranscript:\n{}"
+            ).format(transcript[:12000])
         }
-        out = self._chat([sys, user], temperature=0.4, max_tokens=400)
-        try:
-            j = json.loads(out)
-            return j.get("primer", ""), j.get("host_question", "What part should we unpack first?")
-        except Exception:
-            return out, "What part should we unpack first?"
+        out = self._chat([sys, user], temperature=0.4, max_tokens=300)
+        return out
 
-    def next_turn(self, transcript: str, history: List[Dict[str, str]], student_reply: str) -> Tuple[str, str]:
+    def next_turn(self, transcript: str, history: List[Dict[str, str]], student_reply: str) -> str:
         sys = {
             "role": "system",
             "content": (
-                "You are the Note Coach. Keep answers crisp and intuitive. "
-                "Use the transcript as needed; avoid long quotes. If confused, give a tiny example."
+                "You are the 'Host' (one voice). "
+                "Respond to the student's latest message with: (a) brief helpful context, "
+                "then (b) ONE question that advances the discussion. "
+                "Avoid repeating the same question. Keep <= 120 words total. "
+                "If the student sounds done (e.g., 'that's all'), politely confirm ending."
             )
         }
         user = {
@@ -379,17 +408,11 @@ class MentorLLM:
                 "Transcript (skim as needed):\n{}\n\n"
                 "Chat so far (list of dicts with 'role' and 'text'):\n{}\n\n"
                 "Student just said: {}\n\n"
-                "1) Write a natural host follow-up question to deepen understanding.\n"
-                "2) Then write a clear mentor answer.\n"
-                "Return JSON with keys 'host_question' and 'mentor_answer'. Keep each <= ~120 words."
+                "Return ONLY the final line the Coach should say."
             ).format(transcript[:12000], json.dumps(history[-8:], ensure_ascii=False), student_reply)
         }
-        out = self._chat([sys, user], temperature=0.5, max_tokens=600)
-        try:
-            j = json.loads(out)
-            return j.get("host_question", "What should we tackle next?"), j.get("mentor_answer", out)
-        except Exception:
-            return "What should we tackle next?", out
+        out = self._chat([sys, user], temperature=0.6, max_tokens=350)
+        return out
 
 
 # ---------------------------
@@ -403,12 +426,12 @@ class VoicePodcastSession:
     turns: int = 4
 
     speaker: Speaker = field(init=False)
-    mentor: MentorLLM = field(init=False)
+    coach: CoachLLM = field(init=False)
     history: List[Dict[str, str]] = field(default_factory=list, init=False)
 
     def __post_init__(self):
         self.speaker = Speaker()
-        self.mentor = MentorLLM(model=self.model)
+        self.coach = CoachLLM(model=self.model)
 
     def _listen_for_command(self) -> str:
         self.speaker.say_block("Say the lecture you want, like 'lecture 30' or 'open transcript 30' or 'latest'.")
@@ -424,7 +447,13 @@ class VoicePodcastSession:
     def _listen_reply(self) -> str:
         mic = MicRecorder()
         try:
-            audio = mic.record_until_silence(overall_timeout=22.0)
+            audio = mic.record_until_silence(
+                min_talk_seconds=1.0,   # more generous to avoid cutoffs
+                trailing_silence=1.2,
+                overall_timeout=25.0,
+                start_threshold=700,
+                stop_threshold=500,
+            )
         finally:
             mic.close()
         text = transcribe_one_utterance_bytes(audio)
@@ -449,32 +478,28 @@ class VoicePodcastSession:
             transcript = f.read()
         self.speaker.say_block(f"Opening {os.path.basename(path)}.")
 
-        # 2) Kickoff
-        primer, host_q = self.mentor.kickoff(transcript)
-        if primer:
-            self.speaker.say_block(primer, between_clause_pause=0.3)
-            # small breath after primer
-            time.sleep(0.8)
-        self.speaker.duet_host(host_q)
+        # 2) Kickoff (single Coach line)
+        coach_line = self.coach.kickoff(transcript)
+        self.history.append({"role": "coach", "text": coach_line})
+        self.speaker.say_coach(coach_line)
 
         # 3) Conversation loop (voice in/out)
         for _ in range(self.turns):
             self.speaker.say_block("Your turn.")
             student_text = self._listen_reply()
-            if not student_text or student_text.lower().strip() in {"stop", "exit", "quit", "cancel"}:
-                self.speaker.say_block("Ending session.")
+            if is_stop_phrase(student_text):
+                self.speaker.say_block("Got it. Ending session. Thanks for studying together!")
+                break
+            if not student_text:
+                self.speaker.say_block("I didn't catch that. Let's pause here.")
                 break
 
             self.history.append({"role": "student", "text": student_text})
-            host, mentor = self.mentor.next_turn(transcript, self.history, student_text)
-            self.history.append({"role": "host", "text": host})
-            self.history.append({"role": "mentor", "text": mentor})
+            coach_line = self.coach.next_turn(transcript, self.history, student_text)
+            self.history.append({"role": "coach", "text": coach_line})
 
-            # Speak + print both
-            self.speaker.duet_host(host)
-            self.speaker.duet_mentor(mentor)
+            self.speaker.say_coach(coach_line)
 
-        self.speaker.say_block("That's a wrap. Say 'latest' next time to jump to your most recent lecture.")
 
 
 if __name__ == "__main__":

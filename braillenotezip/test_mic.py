@@ -14,7 +14,7 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 import assemblyai as aai
 import pyaudio
 import pytesseract, shutil
-import numpy as np
+
 
 from assemblyai.streaming.v3 import (
     StreamingClient,
@@ -27,10 +27,8 @@ from assemblyai.streaming.v3 import (
     TerminationEvent,
     StreamingError,
 )
+import pytesseract, shutil
 
-# --- CONFIGURATION ---
-
-# LOCATE TESSERACT
 if shutil.which("tesseract") is None:
     for candidate in [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -40,7 +38,23 @@ if shutil.which("tesseract") is None:
             pytesseract.pytesseract.tesseract_cmd = candidate
             break
 
-# LOAD ENV
+latest_frame = None
+_frame_grabber_stop = False
+def frame_grabber():
+    global latest_frame, _frame_grabber_stop
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    try:
+        while not _frame_grabber_stop:
+            ret, frame = cap.read()
+            if ret:
+                latest_frame = frame
+            time.sleep(0.01)  # yield CPU
+    finally:
+        cap.release()
+
+# Load environment variables
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -49,7 +63,7 @@ aai.settings.api_key = API_KEY
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# LOAD BLIP (Optional)
+# Load BLIP model
 try:
     processor = BlipProcessor.from_pretrained(
         "Salesforce/blip-image-captioning-large",
@@ -65,7 +79,7 @@ except Exception:
     model = None
     print("⚠️  BLIP model not found locally. Visual descriptions will be skipped.")
 
-# TRIGGERS
+# Comprehensive list of visual triggers
 VISUAL_TRIGGERS = [
     "as you can see", "as we can see", "look at this", "if you look here", "shown here", "depicted here",
     "on the board", "on this board", "on the screen", "on this screen", "on the slide", "on this slide",
@@ -73,95 +87,91 @@ VISUAL_TRIGGERS = [
     "this figure shows", "this diagram", "this image shows", "pictured here", "take a look at",
     "check this out", "observe this", "illustrated here", "refer to this image",
     "notice how", "you'll notice", "focus on this", "here's a diagram", "this chart demonstrates",
-    "this example shows", "i'm holding up a", "visualize this", "you can see the", "read this", "read that"
+    "this example shows", "i'm holding up a", "visualize this", "you can see the"
 ]
 
-# GLOBALS
 capturing = threading.Event()
 transcript_lines = []
-latest_frame = None
-_frame_grabber_stop = False
 
-# --- VIDEO CAPTURE ---
-def frame_grabber():
-    global latest_frame, _frame_grabber_stop
-    cap = cv2.VideoCapture(0)
-    # High resolution for OCR
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1) 
-
-    try:
-        while not _frame_grabber_stop:
-            ret, frame = cap.read()
-            if ret:
-                latest_frame = frame
-            time.sleep(0.01)
-    finally:
-        cap.release()
-
-# --- OCR ENGINE ---
-def read_text_from_frame(frame, debug=True):
-    if frame is None: return ""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Scale up 1.5x
-    scale = 1.5
-    h, w = gray.shape
-    roi = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-    roi = cv2.medianBlur(roi, 3)
-    th_adap = cv2.adaptiveThreshold(
-        roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
-    )
-
-    detected_text = []
-    cfgs = ["--oem 3 --psm 6", "--oem 3 --psm 11"]
-    
-    for cfg in cfgs:
-        txt = pytesseract.image_to_string(th_adap, config=cfg).strip()
-        if len(txt) > 2:
-            detected_text.append(txt)
-            if len(txt) > 10: break
-
-    if not detected_text:
-        txt = pytesseract.image_to_string(roi, config="--oem 3 --psm 6").strip()
-        if len(txt) > 2:
-            detected_text.append(txt)
-
-    final_text = " ".join(detected_text).strip()
-    final_text = re.sub(r'\s+', ' ', final_text)
-    
-    if debug and final_text:
-        print(f"[OCR RAW]: {final_text}")
-        
-    return final_text
-
-# --- OPENAI WRAPPER ---
+# OpenAI wrapper updated for openai>=1.0.0
 def ask_openai(prompt: str, model_name="gpt-4") -> str:
     try:
         response = openai.chat.completions.create(
             model=model_name,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant for the visually impaired."},
+                {"role": "system", "content": "You describe images for visually impaired users."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,
-            max_tokens=150,
-            timeout=10,
+            temperature=0.7,
+            max_tokens=300,
+            timeout=15,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"ERROR_OPENAI: {e}"
+        return f"(OpenAI error: {e})"
+def read_text_from_frame(frame, debug=False):
+    import cv2, numpy as np, pytesseract
 
-# --- CAPTURE LOGIC (Updated with Noise Filter) ---
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Heuristic ROI: whiteboard is on the LEFT
+    h, w = gray.shape
+    roi = gray[:, :int(w * 0.65)]
+
+    # Prep
+    roi = cv2.GaussianBlur(roi, (3, 3), 0)
+    roi = cv2.resize(roi, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    roi = clahe.apply(roi)
+
+    th_otsu = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    th_adap = cv2.adaptiveThreshold(
+        roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+    )
+
+    def ensure_white_bg(img):
+        # Tesseract prefers black text on white; invert if necessary
+        return cv2.bitwise_not(img) if img.mean() < 128 else img
+
+    th_otsu = ensure_white_bg(th_otsu)
+    th_adap = ensure_white_bg(th_adap)
+
+    cfgs = [
+        "--oem 3 --psm 7 -c user_defined_dpi=300",
+        "--oem 3 --psm 6 -c user_defined_dpi=300 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    ]
+
+    for name, img in (("otsu", th_otsu), ("adap", th_adap), ("roi", roi)):
+        for cfg in cfgs:
+            # ---------- DEBUG LINE GOES HERE ----------
+            if debug:
+                data = pytesseract.image_to_data(
+                    img, config=cfg, output_type=pytesseract.Output.DICT
+                )
+                words = [(t, float(c)) for t, c in zip(data["text"], data["conf"])
+                         if t.strip() and c != "-1"]
+                print(f"[OCR DEBUG] {name} | {cfg}")
+                print("  words:", words)
+            # -----------------------------------------
+
+            txt = pytesseract.image_to_string(img, config=cfg).strip()
+            if txt:
+                return txt
+
+    if debug:
+        print("[OCR DEBUG] No text found")
+    return ""
+
+
 def capture_and_describe(idx: int):
+    # wait up to 1 s for a frame to appear
     deadline = time.time() + 1
     frame = None
     while frame is None and time.time() < deadline:
         frame = latest_frame
 
     if frame is None:
-        print("❌ No video frame available.")
+        transcript_lines.append("[Visual Description: no frame available]")
         capturing.clear()
         return
 
@@ -169,8 +179,10 @@ def capture_and_describe(idx: int):
     cv2.imwrite(img_filename, frame)
     print(f"📷 Captured image → {img_filename}")
 
-    ocr_text = read_text_from_frame(frame)
+    # then continue with your existing image-to-text logic (BLIP + GPT)…
 
+
+    # BLIP caption
     caption = ""
     if processor and model:
         try:
@@ -180,45 +192,28 @@ def capture_and_describe(idx: int):
             caption = processor.decode(out[0], skip_special_tokens=True)
         except Exception:
             caption = ""
-    
-    # --- PROMPT FIX: FILTERING HALLUCINATIONS ---
-    if ocr_text:
-        prompt = (
-            "You are an assistant for a visually impaired student. "
-            "Your task is to extract meaningful text from a noisy OCR scan.\n\n"
-            f"Raw OCR Output: '{ocr_text}'\n"
-            f"Scene Context: '{caption}'\n\n"
-            "INSTRUCTIONS:\n"
-            "1. The OCR output contains a lot of 'noise' (random characters, icons read as text, etc).\n"
-            "2. FILTER OUT THE NOISE. Do not read the random characters.\n"
-            "3. Find the clear, coherent words (like 'Airplane', 'Exit', 'Chapter 1') and read ONLY those.\n"
-            "4. If the only text is gibberish, use the Scene Context to describe the image instead."
-        )
     else:
-        prompt = (
-            "Describe this scene for a visually impaired student. "
-            f"The image caption is: '{caption}'. No text was detected. "
-            "Keep it brief."
-        )
+        caption = ""
 
-    ai_response = ask_openai(prompt)
 
-    if "ERROR_OPENAI" in ai_response:
-        print(f"⚠️ OpenAI Error: {ai_response}")
-        if ocr_text:
-            final_output = f"I cannot reach the cloud, but I see text that says: {ocr_text}"
-        else:
-            final_output = f"I cannot reach the cloud. Visual description: {caption}"
-    else:
-        final_output = ai_response
+    ocr_text = read_text_from_frame(frame)
 
-    line = f"[Visual Description: {final_output}]"
+    # GPT elaboration
+    prompt = (
+    "You are an assistant describing classroom visuals for a visually impaired student. "
+    "Report exact text verbatim when present, and avoid speculating. "
+    f"BLIP caption: “{caption}”. "
+    f"OCR text detected: {ocr_text or '[none]'}.\n"
+    "If OCR text exists, say it plainly (e.g., “Whiteboard reads: 'TEST'.”)."
+)
+
+
+    detail = ask_openai(prompt)
+    line = f"[Visual Description: {detail}]"
     transcript_lines.append(line)
     print("🔊", line)
-    
     capturing.clear()
 
-# --- AUDIO STREAMING ---
 class AudioGenerator:
     def __init__(self, rate=16000, chunk_size=1024):
         self.rate = rate
@@ -251,10 +246,13 @@ def on_begin(self: Type[StreamingClient], event: BeginEvent):
 
 def on_turn(self: Type[StreamingClient], event: TurnEvent):
     global capturing
+
     if event.end_of_turn and event.turn_is_formatted:
         text = event.transcript.strip()
         transcript_lines.append(text)
+
         lower = text.lower()
+        # fuzzy trigger matching with word boundaries
         if any(re.search(rf"\b{re.escape(kw)}\b", lower) for kw in VISUAL_TRIGGERS) and not capturing.is_set():
             print(f"📌 Visual trigger detected: '{text}'")
             capturing.set()
@@ -262,8 +260,7 @@ def on_turn(self: Type[StreamingClient], event: TurnEvent):
             threading.Thread(target=capture_and_describe, args=(idx,), daemon=True).start()
 
     conf = getattr(event, "end_of_turn_confidence", None)
-    if conf is not None:
-        print(f"Turn: '{event.transcript}' (Confidence: {conf:.2f})")
+    print(f"Turn: '{event.transcript}'" + (f" (Confidence: {conf:.2f})" if conf is not None else ""))
 
     if event.end_of_turn and not event.turn_is_formatted:
         self.set_params(StreamingSessionParameters(format_turns=True))
@@ -307,51 +304,37 @@ def main():
     except Exception as e:
         print(f"Streaming error: {e}")
     finally:
-        # --- SHUTDOWN SEQUENCE FIXED ---
         global _frame_grabber_stop
         _frame_grabber_stop = True
 
-        print("1. Stopping Microphone...")
-        mic.close()
-        
-        print("2. Closing Server Connection...")
-        try:
-            client.disconnect(terminate=True)
-        except Exception:
-            pass
-
-        # Wait a moment for any pending visual captures to finish
-        wait_deadline = time.time() + 3
+        # Wait up to 5 seconds for any visual capture to finish
+        wait_deadline = time.time() + 5
         while capturing.is_set() and time.time() < wait_deadline:
             time.sleep(0.1)
 
         idx = get_next_index()
         wav_filename = f"session{idx}.wav"
         txt_filename = f"transcript{idx}.txt"
-        summary_filename = f"summary{idx}.txt"
 
-        # Save Audio
-        if mic.frames:
-            with wave.open(wav_filename, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(mic.p.get_sample_size(pyaudio.paInt16))
-                wf.setframerate(mic.rate)
-                wf.writeframes(b"".join(mic.frames))
+        mic.close()
+        with wave.open(wav_filename, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(mic.p.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(mic.rate)
+            wf.writeframes(b"".join(mic.frames))
 
-        # Save Transcript
         with open(txt_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
-        
-        print(f"Done — saved {wav_filename} and {txt_filename}")
-        
-        # NOW Generate Summary (Since client is disconnected, no more 'Turn' logs will appear here)
-        print("Generating AI summary… press Ctrl+C to cancel if it hangs.")
+
         from assemblyai import Transcriber, TranscriptionConfig, SummarizationModel, SummarizationType
+        summary_filename = f"summary{idx}.txt"
         config = TranscriptionConfig(
             summarization=True,
             summary_model=SummarizationModel.informative,
             summary_type=SummarizationType.bullets,
         )
+
+        print("Generating AI summary… press Ctrl+C to cancel if it hangs.")
         try:
             summary_job = Transcriber().transcribe(wav_filename, config)
             summary = summary_job.summary or ""
@@ -362,6 +345,13 @@ def main():
             print("Summary generation interrupted by user.")
         except Exception as e:
             print(f"Summary generation failed: {e}")
+
+        client.disconnect(terminate=True)
+        print(f"Done — saved {wav_filename}, {txt_filename}", end="")
+        if os.path.exists(summary_filename):
+            print(f", and {summary_filename}")
+        else:
+            print("")
 
 if __name__ == "__main__":
     main()
